@@ -19,7 +19,7 @@
 #include <math.h>
 #include "hwc_mdpcomp.h"
 #include <sys/ioctl.h>
-#include "external.h"
+#include "hdmi.h"
 #include "virtual.h"
 #include "qdMetaData.h"
 #include "mdp_version.h"
@@ -39,7 +39,6 @@ namespace qhwc {
 
 IdleInvalidator *MDPComp::idleInvalidator = NULL;
 bool MDPComp::sIdleFallBack = false;
-bool MDPComp::sHandleTimeout = false;
 bool MDPComp::sDebugLogs = false;
 bool MDPComp::sEnabled = false;
 bool MDPComp::sEnableMixedMode = true;
@@ -177,20 +176,30 @@ void MDPComp::reset(hwc_context_t *ctx) {
 }
 
 void MDPComp::reset() {
-    sHandleTimeout = false;
+    mPrevModeOn = mModeOn;
     mModeOn = false;
 }
 
 void MDPComp::timeout_handler(void *udata) {
     struct hwc_context_t* ctx = (struct hwc_context_t*)(udata);
+    bool handleTimeout = false;
 
     if(!ctx) {
         ALOGE("%s: received empty data in timer callback", __FUNCTION__);
         return;
     }
+
     Locker::Autolock _l(ctx->mDrawLock);
-    // Handle timeout event only if the previous composition is MDP or MIXED.
-    if(!sHandleTimeout) {
+
+    /* Handle timeout event only if the previous composition
+       on any display is MDP or MIXED*/
+    for(int i = 0; i < HWC_NUM_DISPLAY_TYPES; i++) {
+        if(ctx->mMDPComp[i])
+            handleTimeout =
+                    ctx->mMDPComp[i]->isMDPComp() || handleTimeout;
+    }
+
+    if(!handleTimeout) {
         ALOGD_IF(isDebug(), "%s:Do not handle this timeout", __FUNCTION__);
         return;
     }
@@ -311,12 +320,31 @@ bool MDPComp::LayerCache::isSameFrame(const FrameInfo& curFrame,
     return true;
 }
 
+bool MDPComp::LayerCache::isSameFrame(hwc_context_t *ctx, int dpy,
+                                      hwc_display_contents_1_t* list) {
+
+    if(layerCount != ctx->listStats[dpy].numAppLayers)
+        return false;
+
+    if((list->flags & HWC_GEOMETRY_CHANGED) ||
+       isSkipPresent(ctx, dpy)) {
+        return false;
+    }
+
+    for(int i = 0; i < layerCount; i++) {
+        if(hnd[i] != list->hwLayers[i].handle)
+            return false;
+    }
+
+    return true;
+}
+
 bool MDPComp::isSupportedForMDPComp(hwc_context_t *ctx, hwc_layer_1_t* layer) {
     private_handle_t *hnd = (private_handle_t *)layer->handle;
     if((not isYuvBuffer(hnd) and has90Transform(layer)) or
-        (not isValidDimension(ctx,layer))
-        //More conditions here, SKIP, sRGB+Blend etc
-        ) {
+        (not isValidDimension(ctx,layer)) ||
+        isSkipLayer(layer)) {
+        //More conditions here, sRGB+Blend etc
         return false;
     }
     return true;
@@ -331,7 +359,7 @@ bool MDPComp::isValidDimension(hwc_context_t *ctx, hwc_layer_1_t *layer) {
             // Color layer
             return true;
         }
-        ALOGE("%s: layer handle is NULL", __FUNCTION__);
+        ALOGD_IF(isDebug(), "%s: layer handle is NULL", __FUNCTION__);
         return false;
     }
 
@@ -431,6 +459,13 @@ bool MDPComp::isFrameDoable(hwc_context_t *ctx) {
         //1 Padding round to shift pipes across mixers
         ALOGD_IF(isDebug(),"%s: MDP Comp. video transition padding round",
                 __FUNCTION__);
+        ret = false;
+    } else if(qdutils::MDPVersion::getInstance().is8x26() &&
+              !mDpy && isSecondaryAnimating(ctx) &&
+              (isYuvPresent(ctx,HWC_DISPLAY_EXTERNAL) ||
+               isYuvPresent(ctx,HWC_DISPLAY_VIRTUAL))) {
+        ALOGD_IF(isDebug(),"%s: Display animation in progress",
+                 __FUNCTION__);
         ret = false;
     } else if(isSecondaryConfiguring(ctx)) {
         ALOGD_IF( isDebug(),"%s: External Display connection is pending",
@@ -569,10 +604,11 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
         return false;
     }
 
-    if(isSkipPresent(ctx, mDpy)) {
-        ALOGD_IF(isDebug(),"%s: SKIP present: %d",
-                __FUNCTION__,
-                isSkipPresent(ctx, mDpy));
+    if(!mDpy && isSecondaryAnimating(ctx) &&
+       (isYuvPresent(ctx,HWC_DISPLAY_EXTERNAL) ||
+       isYuvPresent(ctx,HWC_DISPLAY_VIRTUAL)) ) {
+        ALOGD_IF(isDebug(),"%s: Display animation in progress",
+                 __FUNCTION__);
         return false;
     }
 
@@ -900,7 +936,8 @@ bool MDPComp::partialMDPComp(hwc_context_t *ctx, hwc_display_contents_1_t* list)
     }
 
     bool ret = false;
-    if(list->flags & HWC_GEOMETRY_CHANGED) { //Try load based first
+    if(isSkipPresent(ctx, mDpy) or list->flags & HWC_GEOMETRY_CHANGED) {
+        //Try load based first
         ret =   loadBasedComp(ctx, list) or
                 cacheBasedComp(ctx, list);
     } else {
@@ -1091,6 +1128,11 @@ bool MDPComp::videoOnlyComp(hwc_context_t *ctx,
 
     if(!postHeuristicsHandling(ctx, list)) {
         ALOGD_IF(isDebug(), "post heuristic handling failed");
+        if(errno == ENOBUFS) {
+            ALOGD_IF(isDebug(), "SMP Allocation failed");
+            //On SMP allocation failure in video only comp add padding round
+            ctx->isPaddingRound = true;
+        }
         reset(ctx);
         return false;
     }
@@ -1521,6 +1563,16 @@ int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
         ctx->mAnimationState[mDpy] = ANIMATION_STOPPED;
     }
 
+    if(!mDpy and !isSecondaryConnected(ctx) and !mPrevModeOn and
+       mCachedFrame.isSameFrame(ctx,mDpy,list)) {
+        ALOGD_IF(isDebug(),"%s: Avoid new composition",__FUNCTION__);
+        mCurrentFrame.needsRedraw = false;
+        setMDPCompLayerFlags(ctx, list);
+        mCachedFrame.updateCounts(mCurrentFrame);
+        return -1;
+
+    }
+
     //Hard conditions, if not met, cannot do MDP comp
     if(isFrameDoable(ctx)) {
         generateROI(ctx, list);
@@ -1722,11 +1774,6 @@ bool MDPCompNonSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     if(!isEnabled() or !mModeOn) {
         ALOGD_IF(isDebug(),"%s: MDP Comp not enabled/configured", __FUNCTION__);
         return true;
-    }
-
-    // Set the Handle timeout to true for MDP or MIXED composition.
-    if(idleInvalidator && !sIdleFallBack && mCurrentFrame.mdpCount) {
-        sHandleTimeout = true;
     }
 
     overlay::Overlay& ov = *ctx->mOverlay;
@@ -1976,11 +2023,6 @@ bool MDPCompSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     if(!isEnabled() or !mModeOn) {
         ALOGD_IF(isDebug(),"%s: MDP Comp not enabled/configured", __FUNCTION__);
         return true;
-    }
-
-    // Set the Handle timeout to true for MDP or MIXED composition.
-    if(idleInvalidator && !sIdleFallBack && mCurrentFrame.mdpCount) {
-        sHandleTimeout = true;
     }
 
     overlay::Overlay& ov = *ctx->mOverlay;

@@ -125,6 +125,7 @@ BOARD_SEPOLICY_UNION += \
     app.te \
     bluetooth.te \
     bluetooth_loader.te \
+    bootanim.te \
     bridge.te \
     domain.te \
     file.te \
@@ -160,6 +161,7 @@ TARGET_FORCE_HWC_FOR_VIRTUAL_DISPLAYS := true
 
 # QCOM PowerHAL
 TARGET_POWERHAL_VARIANT := qcom
+TARGET_POWERHAL_SET_INTERACTIVE_EXT := device/lge/hammerheadcaf/power/power_ext.c
 
 USE_DEVICE_SPECIFIC_QCOM_PROPRIETARY:= true
 USE_DEVICE_SPECIFIC_CAMERA:= true
