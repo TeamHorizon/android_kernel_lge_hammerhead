@@ -2,7 +2,7 @@
   {
     "remote": "cm",
     "repository": "android_kernel_lge_hammerhead",
-    "target_path": "kernel/lge/hammerhead",
+    "target_path": "kernel/lge/hammerheadcaf",
     "revision": "cm-12.1-caf"
   },
   { "remote": "th",
